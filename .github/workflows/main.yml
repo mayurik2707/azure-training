@@ -37,7 +37,7 @@ jobs:
         run: |
           mkdir -p artifact
           # Adjust the jar name pattern if your finalName is customized in pom.xml
-          cp target/*.jar artifact/app.jar
+          cp "${{ github.workspace }}/azure-sql-java-demo/target/"*.jar artifact/app.jar
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
