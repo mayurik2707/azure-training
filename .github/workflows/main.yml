@@ -1,0 +1,72 @@
+name: CI/CD - Spring Boot to Azure Web App
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AZURE_WEBAPP_NAME: as-app-dev-inst
+  JAVA_VERSION: '17'
+  # If you deploy to a slot, add: AZURE_WEBAPP_SLOT: 'staging'
+
+jobs:
+  build-test:
+    name: Build & Test (Maven)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: Maven - Build with tests
+        run: mvn -B -DskipTests=false clean package
+
+      - name: Archive build artifact (JAR)
+        run: |
+          mkdir -p artifact
+          # Adjust the jar name pattern if your finalName is customized in pom.xml
+          cp target/*.jar artifact/app.jar
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: artifact/app.jar
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to Azure Web App
+    needs: build-test
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: .
+      
+      # Option A: Deploy using publish profile (simplest)
+      - name: Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          # slot-name: ${{ env.AZURE_WEBAPP_SLOT }}   # Uncomment if using deployment slots
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISHPROFILE }}
+          package: app.jar
