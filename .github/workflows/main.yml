@@ -31,9 +31,8 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: 'maven'
 
-      - name: Maven - Build with tests
-        run: mvn -B -DskipTests=false clean package
-
+      - name: Maven - Build with tests	  
+        run: mvn -B -f spring-boot-azure-sql/pom.xml clean package
       - name: Archive build artifact (JAR)
         run: |
           mkdir -p artifact
