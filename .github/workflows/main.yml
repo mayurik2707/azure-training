@@ -32,7 +32,7 @@ jobs:
           cache: 'maven'
 
       - name: Maven - Build with tests	  
-        run: mvn -B -f spring-boot-azure-sql/pom.xml clean package
+        run: mvn -B "${{ github.workspace }}/spring-boot-azure-sql/pom.xml" clean package
       - name: Archive build artifact (JAR)
         run: |
           mkdir -p artifact
