@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tasks · Azure SQL Demo</title>
+  <link rel="stylesheet" th:href="@{/styles.css}" href="/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Tasks</h1>
+
+    <form action="/add" method="post" class="add-form">
+      <input type="text" name="title" placeholder="New task title" required>
+      <button type="submit" class="btn primary">Add</button>
+    </form>
+
+    <ul class="list">
+      <li th:if="${#lists.isEmpty(tasks)}" class="muted">No tasks yet. Add one!</li>
+      <li th:each="t : ${tasks}" class="item" th:classappend="${t.done}? 'done'">
+        <span th:text="${t.title}">Sample Task</span>
+        <div class="actions">
+          <form th:action="@{'/toggle/' + ${t.id}}" method="post">
+            <button class="btn" type="submit" th:text="${t.done} ? 'Mark active' : 'Mark done'"></button>
+          </form>
+          <form th:action="@{'/delete/' + ${t.id}}" method="post" onsubmit="return confirm('Delete this task?');">
+            <button class="btn danger" type="submit">Delete</button>
+          </form>
+        </div>
+      </li>
+    </ul>
+    
+    <!-- ===================== -->
+    <!-- Azure Blob Image Demo -->
+    <!-- ===================== -->
+    <hr />
+    <section>
+      <h2>Image from Azure Blob Storage</h2>
+      <div style="margin: 0.75rem 0;">
+        <button class="btn" type="button" onclick="loadImage()">Load image</button>
+      </div>
+      <div>
+        <img id="blobImage"
+             style="max-width: 100%; height: auto; border: 1px solid #ddd; padding: 4px;">
+      </div>
+    </section>
+
+    <script>
+      async function loadImage() {
+        try {
+          const res = await fetch('/image/url', { cache: 'no-store' });
+          if (!res.ok) throw new Error('Server returned ' + res.status);
+          const sasUrl = await res.text();
+
+          // Optional cache-busting to ensure fresh fetch
+          const url = sasUrl + (sasUrl.includes('?') ? '&' : '?') + 'ts=' + Date.now();
+
+          const img = document.getElementById('blobImage');
+          img.src = url;
+          img.onerror = () => alert('Could not load the image via SAS URL.');
+        } catch (e) {
+          console.error(e);
+          alert('Failed to get SAS URL.');
+        }
+      }
+    </script>
+  </div>
+</body>
+</html>
