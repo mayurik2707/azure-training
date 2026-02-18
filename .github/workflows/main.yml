@@ -9,11 +9,16 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # enables OIDC if you later switch to federated auth
 
 env:
   AZURE_WEBAPP_NAME: as-app-dev-inst
+  AZURE_WEBAPP_SLOT: staging         # <--- use your existing staging slot
+  RESOURCE_GROUP: rg-your-webapp     # <--- set this to your RG
   JAVA_VERSION: '17'
-  # If you deploy to a slot, add: AZURE_WEBAPP_SLOT: 'staging'
+  HEALTH_ENDPOINT: '/actuator/health'
+  STAGING_HEALTH_URL: 'https://as-app-dev-inst-staging.azurewebsites.net/actuator/health'
+  PROD_HEALTH_URL: 'https://as-app-dev-inst.azurewebsites.net/actuator/health'
 
 jobs:
   build-test:
@@ -31,13 +36,15 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: 'maven'
 
-      - name: Maven - Build with tests	  
+      - name: Maven - Build with tests
         run: mvn -B -f "${{ github.workspace }}/azure-sql-java-demo/pom.xml" clean package
+
       - name: Archive build artifact (JAR)
         run: |
           mkdir -p artifact
           # Adjust the jar name pattern if your finalName is customized in pom.xml
           cp "${{ github.workspace }}/azure-sql-java-demo/target/"*.jar artifact/app.jar
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -46,11 +53,12 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    name: Deploy to Azure Web App
+    name: Deploy to Staging slot (Green)
     needs: build-test
     runs-on: ubuntu-latest
+    # Keep the existing environment if others depend on it; or change to 'staging'
     environment:
-      name: production
+      name: staging
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
 
     steps:
@@ -59,13 +67,95 @@ jobs:
         with:
           name: spring-boot-jar
           path: .
-      
-      # Option A: Deploy using publish profile (simplest)
-      - name: Deploy to Azure Web App
+
+      # Deploy to STAGING slot using the existing publish profile (unchanged action)
+      - name: Deploy to Azure Web App (staging slot)
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          # slot-name: ${{ env.AZURE_WEBAPP_SLOT }}   # Uncomment if using deployment slots
+          slot-name: ${{ env.AZURE_WEBAPP_SLOT }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISHPROFILE }}
           package: app.jar
+      # azure/webapps-deploy supports slot-name and JAR deploy as used here. [6](https://github.com/Azure/webapps-deploy/blob/master/README.md)
+
+      - name: Warm-up & Health check (staging)
+        run: |
+          set -e
+          echo "Checking ${STAGING_HEALTH_URL}"
+          for i in {1..30}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${STAGING_HEALTH_URL}")
+            echo "Attempt $i => HTTP $code"
+            if [ "$code" -eq 200 ]; then
+              echo "Staging is healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Staging health check failed."
+          exit 1
+        # Warming a slot before swap improves reliability & avoids long swaps. [1](https://learn.microsoft.com/en-us/azure/app-service/deploy-staging-slots)[5](https://colemike.com/2024/07/10/warming-azure-app-services-slot-before-swapping/)
+
+  swap:
+    name: Swap Staging → Production (Blue-Green)
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Azure login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap slots
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -e
+            az webapp deployment slot swap \
+              --resource-group $RESOURCE_GROUP \
+              --name $AZURE_WEBAPP_NAME \
+              --slot $AZURE_WEBAPP_SLOT \
+              --target-slot production
+        # 'az webapp deployment slot swap' is the supported way to swap slots. [2](https://learn.microsoft.com/en-us/cli/azure/webapp/deployment/slot?view=azure-cli-latest)
+
+      - name: Post-swap health check (production)
+        id: prod-health
+        run: |
+          set -e
+          for i in {1..30}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${PROD_HEALTH_URL}")
+            echo "Attempt $i => HTTP $code"
+            if [ "$code" -eq 200 ]; then
+              echo "Production is healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Production health check failed."
+          exit 1
+
+  rollback:
+    name: Rollback (Swap back to previous)
+    needs: swap
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap back
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -e
+            az webapp deployment slot swap \
+              --resource-group $RESOURCE_GROUP \
+              --name $AZURE_WEBAPP_NAME \
+              --slot $AZURE_WEBAPP_SLOT \
+              --target-slot production
+        # Fast rollback by swapping back is a core benefit of slots. [1](https://learn.microsoft.com/en-us/azure/app-service/deploy-staging-slots)
