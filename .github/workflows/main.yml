@@ -7,23 +7,27 @@ on:
     branches: [ "master" ]
   workflow_dispatch:
 
+# Cancel older in-progress runs if a new commit arrives on the same branch
+concurrency:
+  group: webapp-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   id-token: write   # enables OIDC if you later switch to federated auth
 
 env:
   AZURE_WEBAPP_NAME: as-app-dev-inst
-  AZURE_WEBAPP_SLOT: staging         # <--- use your existing staging slot
-  RESOURCE_GROUP: RG-app-infra-dev     # <--- set this to your RG
+  AZURE_WEBAPP_SLOT: staging                 # use your existing staging slot
+  RESOURCE_GROUP: RG-app-infra-dev             # set this to your RG
   JAVA_VERSION: '17'
-  # Prefer liveness for slot warm‑up so DB outages don’t block swap readiness
-  STAGING_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health/liveness'
-  PROD_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
-
+  STAGING_HEALTH_URL: 'https://as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
+  PROD_HEALTH_URL: 'https://as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
 jobs:
   build-test:
     name: Build & Test (Maven)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -41,6 +45,7 @@ jobs:
 
       - name: Archive build artifact (JAR)
         run: |
+          set -euo pipefail
           mkdir -p artifact
           # Adjust the jar name pattern if your finalName is customized in pom.xml
           cp "${{ github.workspace }}/azure-sql-java-demo/target/"*.jar artifact/app.jar
@@ -56,10 +61,10 @@ jobs:
     name: Deploy to Staging slot (Green)
     needs: build-test
     runs-on: ubuntu-latest
-    # Keep the existing environment if others depend on it; or change to 'staging'
     environment:
       name: staging
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    timeout-minutes: 20
 
     steps:
       - name: Download artifact
@@ -68,7 +73,7 @@ jobs:
           name: spring-boot-jar
           path: .
 
-      # Deploy to STAGING slot using the existing publish profile (unchanged action)
+      # Deploy to STAGING slot using the existing publish profile
       - name: Deploy to Azure Web App (staging slot)
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
@@ -77,48 +82,62 @@ jobs:
           slot-name: ${{ env.AZURE_WEBAPP_SLOT }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISHPROFILE }}
           package: app.jar
-      # azure/webapps-deploy supports slot-name and JAR deploy as used here.
 
-      # --- Optional pre-flight: uncomment if you want an extra early check ---
-      # - name: Pre-flight HEAD to root (staging)
-      #   run: |
-      #     set -e
-      #     curl -I --connect-timeout 15 --retry 5 --retry-delay 3 \
-      #       https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.AZURE_WEBAPP_SLOT }}.azurewebsites.net
-
+      # Warm-up & Health check using /actuator/health (no liveness)
       - name: Warm-up & Health check (staging)
+        timeout-minutes: 8
         run: |
-          set -e
-          echo "Checking ${STAGING_HEALTH_URL}"
-          # Require 3 consecutive 200s to reduce flakiness during startup
-          ok=0
-          for i in {1..60}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-              --connect-timeout 30 --retry 4 --retry-delay 5 --retry-all-errors \
-              "${STAGING_HEALTH_URL}" || echo "000")
-            echo "Attempt $i => HTTP $code"
-            if [ "$code" -eq 200 ]; then
-              ok=$((ok+1))
-              if [ $ok -ge 3 ]; then
-                echo "Staging is healthy (3 consecutive 200s)."
+          set -euo pipefail
+
+          HEALTH_URL="${STAGING_HEALTH_URL}"
+          echo "Checking $HEALTH_URL"
+
+          # We require 3 consecutive UPs, bounded attempts, short connect + max time limits.
+          consecutive_ok=0
+          max_attempts=15
+          sleep_between=5
+
+          for i in $(seq 1 $max_attempts); do
+            # Keep curl bounded to avoid hanging forever:
+            # --connect-timeout caps connect phase; --max-time caps total time for the request
+            http_code=$(curl -sS -o response.json -w "%{http_code}" \
+              --connect-timeout 10 --max-time 15 "$HEALTH_URL" || echo "000")
+
+            status_str=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' response.json || true)
+            echo "Attempt $i => HTTP $http_code | $status_str"
+
+            # Consider healthy only if 200 and status:UP in body
+            if [ "$http_code" = "200" ] && grep -q '"status"[[:space:]]*:[[:space:]]*"UP"' response.json; then
+              consecutive_ok=$((consecutive_ok+1))
+              if [ $consecutive_ok -ge 3 ]; then
+                echo "Staging is healthy (3 consecutive UPs)."
+                rm -f response.json
                 exit 0
               fi
             else
-              ok=0
+              consecutive_ok=0
             fi
-            sleep 5
+
+            sleep "$sleep_between"
           done
-          echo "Staging health check failed."
+
+          echo "Staging health check failed (not UP within limits)."
+          echo "Last response body (truncated to 1KB) for debugging:"
+          head -c 1024 response.json || true
+          rm -f response.json || true
           exit 1
-        # Warming a slot before swap improves reliability & avoids long swaps.
 
   swap:
     name: Swap Staging → Production (Blue-Green)
     needs: deploy
-    if: ${{ needs.deploy.result == 'success' }}   # <-- gate: swap runs only if warm-up succeeded
+    if: ${{ needs.deploy.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: production
+    timeout-minutes: 20
+
+    outputs:
+      swap-executed: ${{ steps.mark-swap.outputs.swap_executed }}
 
     steps:
       - name: Azure login (Service Principal)
@@ -128,62 +147,93 @@ jobs:
 
       # Final gate: verify staging still healthy before swap (triple-check)
       - name: Verify staging still healthy (pre-swap)
+        timeout-minutes: 3
         run: |
-          set -e
-          echo "Final gate: ${STAGING_HEALTH_URL}"
+          set -euo pipefail
+          HEALTH_URL="${STAGING_HEALTH_URL}"
+          echo "Final gate check => $HEALTH_URL"
           for i in 1 2 3; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "${STAGING_HEALTH_URL}")
-            echo "Gate probe $i => HTTP $code"
-            [ "$code" -eq 200 ] || { echo "Gate failed"; exit 1; }
+            code=$(curl -sS -o body.json -w "%{http_code}" --connect-timeout 10 --max-time 15 "$HEALTH_URL" || echo "000")
+            status_str=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' body.json || true)
+            echo "Gate probe $i => HTTP $code | $status_str"
+            if [ "$code" != "200" ] || ! grep -q '"status"[[:space:]]*:[[:space:]]*"UP"' body.json; then
+              echo "Gate failed: staging not UP."
+              exit 1
+            fi
             sleep 2
           done
+          rm -f body.json || true
 
       - name: Swap slots
         uses: azure/cli@v2
         with:
           inlineScript: |
-            set -e
+            set -euo pipefail
             az webapp deployment slot swap \
-              --resource-group $RESOURCE_GROUP \
-              --name $AZURE_WEBAPP_NAME \
-              --slot $AZURE_WEBAPP_SLOT \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --slot "$AZURE_WEBAPP_SLOT" \
               --target-slot production
-        # 'az webapp deployment slot swap' is the supported way to swap slots.
+
+      # Mark that swap has executed successfully
+      - name: Mark swap executed
+        id: mark-swap
+        run: |
+          echo "swap_executed=true" >> "$GITHUB_OUTPUT"
 
       - name: Post-swap health check (production)
         id: prod-health
+        timeout-minutes: 8
         run: |
-          set -e
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "${PROD_HEALTH_URL}")
-            echo "Attempt $i => HTTP $code"
-            if [ "$code" -eq 200 ]; then
+          set -euo pipefail
+          HEALTH_URL="${PROD_HEALTH_URL}"
+          echo "Post-swap production health => $HEALTH_URL"
+
+          consecutive_ok=0
+          max_attempts=30
+          sleep_between=5
+
+          for i in $(seq 1 $max_attempts); do
+            http_code=$(curl -sS -o response.json -w "%{http_code}" \
+              --connect-timeout 10 --max-time 15 "$HEALTH_URL" || echo "000")
+            status_str=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' response.json || true)
+            echo "Attempt $i => HTTP $http_code | $status_str"
+
+            if [ "$http_code" = "200" ] && grep -q '"status"[[:space:]]*:[[:space:]]*"UP"' response.json; then
               echo "Production is healthy."
+              rm -f response.json
               exit 0
             fi
-            sleep 5
+            sleep "$sleep_between"
           done
+
           echo "Production health check failed."
+          echo "Last response body (truncated to 1KB) for debugging:"
+          head -c 1024 response.json || true
+          rm -f response.json || true
           exit 1
 
   rollback:
     name: Rollback (Swap back to previous)
     needs: swap
-    if: failure()
+    # Run only if something in 'swap' failed AND the swap actually executed earlier.
+    if: ${{ failure() && needs.swap.result == 'failure' && needs.swap.outputs.swap-executed == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Azure login (Service Principal)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Swap back
+      - name: Swap back (rollback)
         uses: azure/cli@v2
         with:
           inlineScript: |
-            set -e
+            set -euo pipefail
             az webapp deployment slot swap \
-              --resource-group $RESOURCE_GROUP \
-              --name $AZURE_WEBAPP_NAME \
-              --slot $AZURE_WEBAPP_SLOT \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --slot "$AZURE_WEBAPP_SLOT" \
               --target-slot production
