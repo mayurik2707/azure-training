@@ -7,18 +7,27 @@ on:
     branches: [ "master" ]
   workflow_dispatch:
 
+# Cancel older in-progress runs if a new commit arrives on the same branch
+concurrency:
+  group: webapp-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+  id-token: write   # enables OIDC if you later switch to federated auth
 
 env:
   AZURE_WEBAPP_NAME: as-app-dev-inst
+  AZURE_WEBAPP_SLOT: staging                 # use your existing staging slot
+  RESOURCE_GROUP: RG-app-infra-dev             # set this to your RG
   JAVA_VERSION: '17'
-  # If you deploy to a slot, add: AZURE_WEBAPP_SLOT: 'staging'
-
+  STAGING_HEALTH_URL: 'https://as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
+  PROD_HEALTH_URL: 'https://as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
 jobs:
   build-test:
     name: Build & Test (Maven)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -31,13 +40,16 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: 'maven'
 
-      - name: Maven - Build with tests	  
+      - name: Maven - Build with tests
         run: mvn -B -f "${{ github.workspace }}/azure-sql-java-demo/pom.xml" clean package
+
       - name: Archive build artifact (JAR)
         run: |
+          set -euo pipefail
           mkdir -p artifact
           # Adjust the jar name pattern if your finalName is customized in pom.xml
           cp "${{ github.workspace }}/azure-sql-java-demo/target/"*.jar artifact/app.jar
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -46,12 +58,13 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    name: Deploy to Azure Web App
+    name: Deploy to Staging slot (Green)
     needs: build-test
     runs-on: ubuntu-latest
     environment:
-      name: production
+      name: staging
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    timeout-minutes: 20
 
     steps:
       - name: Download artifact
@@ -59,13 +72,168 @@ jobs:
         with:
           name: spring-boot-jar
           path: .
-      
-      # Option A: Deploy using publish profile (simplest)
-      - name: Deploy to Azure Web App
+
+      # Deploy to STAGING slot using the existing publish profile
+      - name: Deploy to Azure Web App (staging slot)
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          # slot-name: ${{ env.AZURE_WEBAPP_SLOT }}   # Uncomment if using deployment slots
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISHPROFILE_PROD }}
+          slot-name: ${{ env.AZURE_WEBAPP_SLOT }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISHPROFILE }}
           package: app.jar
+
+      # Warm-up & Health check using /actuator/health (no liveness)
+      - name: Warm-up & Health check (staging)
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+
+          HEALTH_URL="${STAGING_HEALTH_URL}"
+          echo "Checking $HEALTH_URL"
+
+          # We require 3 consecutive UPs, bounded attempts, short connect + max time limits.
+          consecutive_ok=0
+          max_attempts=15
+          sleep_between=5
+
+          for i in $(seq 1 $max_attempts); do
+            # Keep curl bounded to avoid hanging forever:
+            # --connect-timeout caps connect phase; --max-time caps total time for the request
+            http_code=$(curl -sS -o response.json -w "%{http_code}" \
+              --connect-timeout 10 --max-time 15 "$HEALTH_URL" || echo "000")
+
+            status_str=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' response.json || true)
+            echo "Attempt $i => HTTP $http_code | $status_str"
+
+            # Consider healthy only if 200 and status:UP in body
+            if [ "$http_code" = "200" ] && grep -q '"status"[[:space:]]*:[[:space:]]*"UP"' response.json; then
+              consecutive_ok=$((consecutive_ok+1))
+              if [ $consecutive_ok -ge 3 ]; then
+                echo "Staging is healthy (3 consecutive UPs)."
+                rm -f response.json
+                exit 0
+              fi
+            else
+              consecutive_ok=0
+            fi
+
+            sleep "$sleep_between"
+          done
+
+          echo "Staging health check failed (not UP within limits)."
+          echo "Last response body (truncated to 1KB) for debugging:"
+          head -c 1024 response.json || true
+          rm -f response.json || true
+          exit 1
+
+  swap:
+    name: Swap Staging → Production (Blue-Green)
+    needs: deploy
+    if: ${{ needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 20
+
+    outputs:
+      swap-executed: ${{ steps.mark-swap.outputs.swap_executed }}
+
+    steps:
+      - name: Azure login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Final gate: verify staging still healthy before swap (triple-check)
+      - name: Verify staging still healthy (pre-swap)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          HEALTH_URL="${STAGING_HEALTH_URL}"
+          echo "Final gate check => $HEALTH_URL"
+          for i in 1 2 3; do
+            code=$(curl -sS -o body.json -w "%{http_code}" --connect-timeout 10 --max-time 15 "$HEALTH_URL" || echo "000")
+            status_str=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' body.json || true)
+            echo "Gate probe $i => HTTP $code | $status_str"
+            if [ "$code" != "200" ] || ! grep -q '"status"[[:space:]]*:[[:space:]]*"UP"' body.json; then
+              echo "Gate failed: staging not UP."
+              exit 1
+            fi
+            sleep 2
+          done
+          rm -f body.json || true
+
+      - name: Swap slots
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az webapp deployment slot swap \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --slot "$AZURE_WEBAPP_SLOT" \
+              --target-slot production
+
+      # Mark that swap has executed successfully
+      - name: Mark swap executed
+        id: mark-swap
+        run: |
+          echo "swap_executed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Post-swap health check (production)
+        id: prod-health
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          HEALTH_URL="${PROD_HEALTH_URL}"
+          echo "Post-swap production health => $HEALTH_URL"
+
+          consecutive_ok=0
+          max_attempts=30
+          sleep_between=5
+
+          for i in $(seq 1 $max_attempts); do
+            http_code=$(curl -sS -o response.json -w "%{http_code}" \
+              --connect-timeout 10 --max-time 15 "$HEALTH_URL" || echo "000")
+            status_str=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' response.json || true)
+            echo "Attempt $i => HTTP $http_code | $status_str"
+
+            if [ "$http_code" = "200" ] && grep -q '"status"[[:space:]]*:[[:space:]]*"UP"' response.json; then
+              echo "Production is healthy."
+              rm -f response.json
+              exit 0
+            fi
+            sleep "$sleep_between"
+          done
+
+          echo "Production health check failed."
+          echo "Last response body (truncated to 1KB) for debugging:"
+          head -c 1024 response.json || true
+          rm -f response.json || true
+          exit 1
+
+  rollback:
+    name: Rollback (Swap back to previous)
+    needs: swap
+    # Run only if something in 'swap' failed AND the swap actually executed earlier.
+    if: ${{ failure() && needs.swap.result == 'failure' && needs.swap.outputs.swap-executed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Azure login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap back (rollback)
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az webapp deployment slot swap \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$AZURE_WEBAPP_NAME" \
+              --slot "$AZURE_WEBAPP_SLOT" \
+              --target-slot production
