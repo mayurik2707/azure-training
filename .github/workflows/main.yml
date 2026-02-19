@@ -13,12 +13,12 @@ permissions:
 
 env:
   AZURE_WEBAPP_NAME: as-app-dev-inst
-  AZURE_WEBAPP_SLOT: staging         # <--- use your existing staging slot
-  RESOURCE_GROUP: rg-your-webapp     # <--- set this to your RG
+  AZURE_WEBAPP_SLOT: staging         
+  RESOURCE_GROUP: rg-app-infra-dev    
   JAVA_VERSION: '17'
   HEALTH_ENDPOINT: '/actuator/health'
-  STAGING_HEALTH_URL: 'https://as-app-dev-inst-staging.azurewebsites.net/actuator/health'
-  PROD_HEALTH_URL: 'https://as-app-dev-inst.azurewebsites.net/actuator/health'
+  STAGING_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
+  PROD_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
 
 jobs:
   build-test:
