@@ -13,11 +13,11 @@ permissions:
 
 env:
   AZURE_WEBAPP_NAME: as-app-dev-inst
-  AZURE_WEBAPP_SLOT: staging         
-  RESOURCE_GROUP: rg-app-infra-dev    
+  AZURE_WEBAPP_SLOT: staging         # <--- use your existing staging slot
+  RESOURCE_GROUP: RG-app-infra-dev     # <--- set this to your RG
   JAVA_VERSION: '17'
-  HEALTH_ENDPOINT: '/actuator/health'
-  STAGING_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
+  # Prefer liveness for slot warm‑up so DB outages don’t block swap readiness
+  STAGING_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health/liveness'
   PROD_HEALTH_URL: 'as-app-dev-inst-cgbramenhne7b9de.centralindia-01.azurewebsites.net/actuator/health'
 
 jobs:
@@ -77,28 +77,45 @@ jobs:
           slot-name: ${{ env.AZURE_WEBAPP_SLOT }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISHPROFILE }}
           package: app.jar
-      # azure/webapps-deploy supports slot-name and JAR deploy as used here. [6](https://github.com/Azure/webapps-deploy/blob/master/README.md)
+      # azure/webapps-deploy supports slot-name and JAR deploy as used here.
+
+      # --- Optional pre-flight: uncomment if you want an extra early check ---
+      # - name: Pre-flight HEAD to root (staging)
+      #   run: |
+      #     set -e
+      #     curl -I --connect-timeout 15 --retry 5 --retry-delay 3 \
+      #       https://${{ env.AZURE_WEBAPP_NAME }}-${{ env.AZURE_WEBAPP_SLOT }}.azurewebsites.net
 
       - name: Warm-up & Health check (staging)
         run: |
           set -e
           echo "Checking ${STAGING_HEALTH_URL}"
-          for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "${STAGING_HEALTH_URL}")
+          # Require 3 consecutive 200s to reduce flakiness during startup
+          ok=0
+          for i in {1..60}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              --connect-timeout 30 --retry 4 --retry-delay 5 --retry-all-errors \
+              "${STAGING_HEALTH_URL}" || echo "000")
             echo "Attempt $i => HTTP $code"
             if [ "$code" -eq 200 ]; then
-              echo "Staging is healthy."
-              exit 0
+              ok=$((ok+1))
+              if [ $ok -ge 3 ]; then
+                echo "Staging is healthy (3 consecutive 200s)."
+                exit 0
+              fi
+            else
+              ok=0
             fi
             sleep 5
           done
           echo "Staging health check failed."
           exit 1
-        # Warming a slot before swap improves reliability & avoids long swaps. [1](https://learn.microsoft.com/en-us/azure/app-service/deploy-staging-slots)[5](https://colemike.com/2024/07/10/warming-azure-app-services-slot-before-swapping/)
+        # Warming a slot before swap improves reliability & avoids long swaps.
 
   swap:
     name: Swap Staging → Production (Blue-Green)
     needs: deploy
+    if: ${{ needs.deploy.result == 'success' }}   # <-- gate: swap runs only if warm-up succeeded
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -108,6 +125,18 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Final gate: verify staging still healthy before swap (triple-check)
+      - name: Verify staging still healthy (pre-swap)
+        run: |
+          set -e
+          echo "Final gate: ${STAGING_HEALTH_URL}"
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${STAGING_HEALTH_URL}")
+            echo "Gate probe $i => HTTP $code"
+            [ "$code" -eq 200 ] || { echo "Gate failed"; exit 1; }
+            sleep 2
+          done
 
       - name: Swap slots
         uses: azure/cli@v2
@@ -119,7 +148,7 @@ jobs:
               --name $AZURE_WEBAPP_NAME \
               --slot $AZURE_WEBAPP_SLOT \
               --target-slot production
-        # 'az webapp deployment slot swap' is the supported way to swap slots. [2](https://learn.microsoft.com/en-us/cli/azure/webapp/deployment/slot?view=azure-cli-latest)
+        # 'az webapp deployment slot swap' is the supported way to swap slots.
 
       - name: Post-swap health check (production)
         id: prod-health
@@ -158,4 +187,3 @@ jobs:
               --name $AZURE_WEBAPP_NAME \
               --slot $AZURE_WEBAPP_SLOT \
               --target-slot production
-        # Fast rollback by swapping back is a core benefit of slots. [1](https://learn.microsoft.com/en-us/azure/app-service/deploy-staging-slots)
